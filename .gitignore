@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# MacOS
+.DS_Store
+
+# Milvus vectorstore
+vectorstore/db/
+
+# Streamlit cache
+.streamlit/
+
+# Docker
+*.log
+
+# Test outputs
+*.coverage
+htmlcov/
+
+# Misc
+*.swp
+*.bak
+*.tmp
+
+# Ignore data if needed
+# data/
