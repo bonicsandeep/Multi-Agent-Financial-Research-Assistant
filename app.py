@@ -1,4 +1,5 @@
 # Streamlit UI for financial research assistant
+import env_loader
 import streamlit as st
 from tools.vector_search import vector_search
 from agents.analyst import Analyst

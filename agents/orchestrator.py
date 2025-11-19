@@ -10,10 +10,17 @@ coordination plan for each agent.
 from __future__ import annotations
 
 import re
+import logging
+import concurrent.futures
 from dataclasses import dataclass
 from typing import Dict, List, Sequence
 
 from agents.analyst import Analyst
+from agents.research_agent import ResearchAgent
+from agents.data_agent import DataAgent
+from agents.rag_agent import RAGAgent
+from agents.reviewer_agent import ReviewerAgent
+from agents.finnhub_agent import FinnhubNewsAgent
 
 # ---------------------------------------------------------------------------
 # Static knowledge base that emulates downstream agents and data sources.
@@ -185,18 +192,30 @@ class CitationRegistry:
 class Orchestrator:
     """Coordinates the financial research workflow end-to-end."""
 
-    def __init__(self, analyst: Analyst | None = None) -> None:
+    def __init__(
+        self,
+        analyst: Analyst | None = None,
+        realtime_ingest: bool = True,
+        ingest_timeout: int = 15,
+        ingest_window_minutes: int = 60,
+    ) -> None:
         self.analyst = analyst or Analyst()
         self.registry = CitationRegistry(SOURCE_LIBRARY)
+        self.research_agent = ResearchAgent()
+        self.data_agent = DataAgent()
+        self.rag_agent = RAGAgent()
+        self.reviewer_agent = ReviewerAgent()
+        # realtime ingestion config
+        self.realtime_ingest = realtime_ingest
+        self.ingest_timeout = ingest_timeout
+        self.ingest_window_minutes = ingest_window_minutes
 
     # ------------------------------------------------------------------ #
     # Query understanding helpers
     # ------------------------------------------------------------------ #
     def clarify_query(self, query: str) -> Dict[str, object]:
         normalized = query.lower()
-        entities = self._extract_entities(normalized)
-        if not entities:
-            entities = ["Nvidia"]
+        entities = self._extract_entities(normalized, query)
         timeframe = self._extract_timeframe(query)
         depth = self._extract_depth(normalized)
         risk = self._extract_risk(normalized)
@@ -210,18 +229,49 @@ class Orchestrator:
             "metrics": metrics,
         }
 
-    def _extract_entities(self, normalized_query: str) -> List[str]:
-        alias_map = {}
+    def _extract_entities(self, normalized_query: str, raw_query: str | None = None) -> List[str]:
+        # Build alias map (alias lowercase -> canonical name)
+        alias_map: dict[str, str] = {}
+        ticker_map: dict[str, str] = {}
         for name, profile in COMPANY_PROFILES.items():
             for alias in profile.get("aliases", []):
                 alias_map[alias.lower()] = name
             alias_map[name.lower()] = name
-            alias_map[profile["ticker"].lower()] = name  # type: ignore[index]
+            ticker = profile.get("ticker")
+            if ticker:
+                alias_map[ticker.lower()] = name
+                ticker_map[ticker.upper()] = name
+
         entities: List[str] = []
-        for alias, canonical in alias_map.items():
-            if alias in normalized_query and canonical not in entities:
-                entities.append(canonical)
-        return entities[:2]  # Limit to pairwise comparisons for clarity
+        # Prefer longest alias matches first to avoid substring collisions
+        alias_keys = sorted(alias_map.keys(), key=lambda x: -len(x))
+        for alias in alias_keys:
+            pattern = r"\b" + re.escape(alias) + r"\b"
+            if re.search(pattern, normalized_query) and alias_map[alias] not in entities:
+                entities.append(alias_map[alias])
+
+        # If still empty, try to detect capitalized proper nouns in the raw query
+        if not entities and raw_query:
+            cap_tokens = re.findall(r"\b([A-Z][a-zA-Z]{1,})\b", raw_query)
+            for tok in cap_tokens:
+                # direct company name match
+                if tok in COMPANY_PROFILES and tok not in entities:
+                    entities.append(tok)
+                    continue
+                # alias map match by lowercased token
+                mapped = alias_map.get(tok.lower())
+                if mapped and mapped not in entities:
+                    entities.append(mapped)
+
+        # Also consider ticker-like uppercase tokens e.g., 'AAPL'
+        if len(entities) < 2 and raw_query:
+            ticker_tokens = re.findall(r"\b[A-Z]{2,5}\b", raw_query)
+            for tok in ticker_tokens:
+                mapped = ticker_map.get(tok)
+                if mapped and mapped not in entities:
+                    entities.append(mapped)
+
+        return entities[:2]
 
     def _extract_timeframe(self, query: str) -> str:
         normalized = query.lower()
@@ -318,9 +368,10 @@ class Orchestrator:
         news_data = self._collect_news_data(entities)
         doc_data = self._collect_document_data(entities)
 
-        financial_snapshot = self._format_financial_snapshot(
-            financial_data, clarification["metrics"]  # type: ignore[arg-type]
-        )
+        financial_data = self._collect_financial_data(entities)
+        news_data = self._collect_news_data(entities)
+        doc_data = self._collect_document_data(entities)
+        financial_snapshot = self._format_financial_snapshot(financial_data, clarification["metrics"])
         market_context = self._format_market_context(news_data)
         document_insights = self._format_document_insights(doc_data)
         competitive_positioning = self._format_competitive_positioning(financial_data, doc_data)
@@ -478,9 +529,23 @@ class Orchestrator:
     # Recommendation synthesis
     # ------------------------------------------------------------------ #
     def synthesize_recommendation(self, results: Dict[str, object], clarification: Dict[str, object]) -> Dict[str, str]:
-        financial_data = results["raw"]["financial_data"]  # type: ignore[index]
-        doc_data = results["raw"]["doc_data"]  # type: ignore[index]
-        news_data = results["raw"]["news_data"]  # type: ignore[index]
+        financial_data = results.get("raw", {}).get("financial_data", [])  # type: ignore[index]
+        doc_data = results.get("raw", {}).get("doc_data", [])  # type: ignore[index]
+        news_data = results.get("raw", {}).get("news_data", [])  # type: ignore[index]
+
+        # If we lack financial data, return a safe placeholder recommendation
+        if not financial_data:
+            return {
+                "thesis": "No financial profiles available for the requested entities.",
+                "risk_reward": "",
+                "catalysts": ", ".join(
+                    [f"{item.get('company','')}: {item.get('summary','')}" for item in news_data]
+                ),
+                "disclaimer": (
+                    "This is for educational analysis only and not investment advice. Consult a financial advisor before investing. "
+                    "Past performance does not guarantee future results."
+                ),
+            }
 
         nvda = financial_data[0]
         amd = financial_data[1] if len(financial_data) > 1 else None
@@ -497,7 +562,7 @@ class Orchestrator:
 
         catalysts = ", ".join(
             [
-                f"{item['company']} – {item['summary']} {self.registry.cite(item['source'])}"
+                f"{item.get('company','')} – {item.get('summary','')} {self.registry.cite(item['source'])}"
                 for item in news_data
             ]
         )
@@ -536,7 +601,130 @@ class Orchestrator:
         self.registry = CitationRegistry(SOURCE_LIBRARY)
         clarification = self.clarify_query(query)
         plan = self.agent_coordination_plan(clarification)
-        results = self.investigate(clarification, plan)
+        entities = clarification["entities"]
+        # Step 1: Research
+        try:
+            news = self.research_agent.run(entities)
+        except Exception as e:
+            news = {c: {"error": str(e)} for c in entities}
+
+        # Step 2: Data - pass tickers (if available) to DataAgent so yfinance is queried with symbols
+        try:
+            tickers = [COMPANY_PROFILES.get(e, {}).get("ticker", e) for e in entities]
+            data = self.data_agent.run(tickers)
+        except Exception as e:
+            data = {c: {"error": str(e)} for c in entities}
+
+        # On-demand ingestion: always attempt to fetch recent news for relevant targets
+        # Build a broadened set of ingest targets from tickers, clarified entity names,
+        # and any uppercase ticker-like tokens present in the original query.
+        ingest_targets: list[str] = []
+        new_articles: list[dict] = []
+        try:
+            fh = FinnhubNewsAgent()
+            # entities from clarification (canonical names)
+            entities_from_clarify = clarification.get("entities", [])
+            # ticker-like tokens from the raw query (e.g. 'AAPL', 'MSFT')
+            ticker_tokens = re.findall(r"\b[A-Z]{2,5}\b", query)
+
+            # start with any symbol-like tickers computed earlier
+            for t in tickers:
+                if t and t not in ingest_targets:
+                    ingest_targets.append(t)
+
+            # add canonical entity names (e.g., 'Apple')
+            for e in entities_from_clarify:
+                if e and e not in ingest_targets:
+                    ingest_targets.append(e)
+
+            # also add capitalized tokens from the raw query (e.g., 'Apple') so
+            # that the Finnhub agent can attempt name->ticker resolution when
+            # the company isn't present in COMPANY_PROFILES.
+            cap_tokens = re.findall(r"\b([A-Z][a-zA-Z]{1,})\b", query)
+            for tok in cap_tokens:
+                if tok and tok not in ingest_targets:
+                    ingest_targets.append(tok)
+
+            # add uppercase ticker-like tokens found in the query
+            for tok in ticker_tokens:
+                if tok and tok not in ingest_targets:
+                    ingest_targets.append(tok)
+
+            # final dedupe and filter empties
+            ingest_targets = list(dict.fromkeys([x for x in ingest_targets if x]))
+
+            if ingest_targets:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as exe:
+                    fut = exe.submit(fh.poll_and_upsert, ingest_targets, self.ingest_window_minutes)
+                    try:
+                        new_articles = fut.result(timeout=self.ingest_timeout) or []
+                    except concurrent.futures.TimeoutError:
+                        logging.warning(
+                            "Finnhub on-demand ingest timed out after %s seconds", self.ingest_timeout
+                        )
+                    except Exception as e:
+                        logging.warning("Finnhub on-demand ingest error: %s", e)
+            else:
+                logging.debug("No ingest targets derived from query/tickers; skipping Finnhub ingest.")
+        except Exception as e:
+            # Do not fail the entire orchestrator for ingestion errors
+            logging.warning("Finnhub on-demand ingest setup failed: %s", e)
+            new_articles = []
+
+        # Expose last ingestion metadata on the orchestrator instance for callers/tests
+        try:
+            self.last_ingest = {"targets": ingest_targets, "new_articles": len(new_articles)}
+        except Exception:
+            self.last_ingest = {"targets": [], "new_articles": 0}
+
+        # Step 3: RAG
+        try:
+            chunks = self.rag_agent.run(query, entities)
+        except Exception as e:
+            chunks = {c: [f"Error: {str(e)}"] for c in entities}
+
+        # Produce investigation-derived sections used by the response formatter
+        try:
+            investigation = self.investigate(clarification, plan)
+        except Exception as e:
+            # If investigation fails, provide minimal placeholders
+            investigation = {
+                "financial_snapshot": "No financial snapshot available due to an internal error.",
+                "market_context": "No market context available.",
+                "document_insights": "No document insights available.",
+                "competitive_positioning": "No competitive positioning available.",
+                "raw": {"financial_data": [], "news_data": [], "doc_data": []},
+            }
+
+        # Step 4: Analyst
+        try:
+            answer, citations = self.analyst.run(query, entities, news, data, chunks)
+        except Exception as e:
+            answer = f"Error: {str(e)}"
+            citations = []
+
+        # Step 5: Reviewer
+        try:
+            review = self.reviewer_agent.run(answer, citations)
+        except Exception as e:
+            review = {"valid": False, "issues": [str(e)]}
+
+        results = {
+            "answer": answer,
+            "citations": citations,
+            "news": news,
+            "data": data,
+            "chunks": chunks,
+            "review": review,
+            "ingest": {"targets": ingest_targets, "new_articles": len(new_articles)},
+            # include investigation outputs expected by response formatter
+            "financial_snapshot": investigation.get("financial_snapshot"),
+            "market_context": investigation.get("market_context"),
+            "document_insights": investigation.get("document_insights"),
+            "competitive_positioning": investigation.get("competitive_positioning"),
+            "raw": investigation.get("raw", {}),
+        }
+
         recommendation = self.synthesize_recommendation(results, clarification)
         sources = self.registry.render()
         response = self._format_response(clarification, plan, results, recommendation, sources)

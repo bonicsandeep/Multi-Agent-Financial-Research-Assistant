@@ -1,0 +1,43 @@
+version: '3.5'
+services:
+  milvus-etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: milvus-etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_RETENTION=1
+      - ETCD_QUOTA_BACKEND_BYTES=8589934592
+      - ETCD_SNAPSHOT_COUNT=50000
+    command: ["etcd", "--listen-peer-urls", "http://0.0.0.0:2380", "--listen-client-urls", "http://0.0.0.0:2379", "--advertise-client-urls", "http://0.0.0.0:2379", "--initial-advertise-peer-urls", "http://0.0.0.0:2380", "--initial-cluster", "default=http://0.0.0.0:2380"]
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+  milvus-minio:
+    image: minio/minio:RELEASE.2023-08-16T20-17-30Z
+    container_name: milvus-minio
+    command: server /minio_data --console-address ':9001'
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/minio_data
+  milvus:
+    image: milvusdb/milvus:v2.3.9
+    container_name: milvus
+    command: ["milvus", "run", "standalone"]
+    environment:
+      - ETCD_ENDPOINTS=milvus-etcd:2379
+      - MINIO_ADDRESS=milvus-minio:9000
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      - MINIO_USE_SSL=false
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - milvus-etcd
+      - milvus-minio
+volumes:
+  minio_data:

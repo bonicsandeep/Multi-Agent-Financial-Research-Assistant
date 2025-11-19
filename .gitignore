@@ -39,3 +39,6 @@ htmlcov/
 
 # Ignore data if needed
 # data/
+
+# Local environment variables
+.env
